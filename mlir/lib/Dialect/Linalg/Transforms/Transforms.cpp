@@ -19,6 +19,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/HoistPadding.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
+#include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/IR/TensorTilingInterfaceImpl.h"
@@ -484,6 +485,9 @@ mlir::linalg::LinalgTileAndFuseTensorOpsPattern::returningMatchAndRewrite(
   LinalgOp rootOp = dyn_cast<LinalgOp>(op);
   if (!rootOp)
     return failure();
+  TilingInterface tileOp = dyn_cast<TilingInterface>(op);
+  if (!tileOp)
+    return failure();
   if (failed(filter.checkAndNotify(rewriter, op)))
     return failure();
 
@@ -521,20 +525,43 @@ mlir::linalg::LinalgTileAndFuseTensorOpsPattern::returningMatchAndRewrite(
         op, "expect the tile interchange permutes the root loops");
 
   // Tile `rootOp` and fuse its producers.
+  /*
   FailureOr<TileLoopNest> tileLoopNest =
       tileConsumerAndFuseProducers(rewriter, rootOp, rootTileSizes,
                                    rootInterchange, options.tileDistribution);
-  if (failed(tileLoopNest))
+  */
+
+  SmallVector<unsigned int> tileInterchange;
+  for (auto value : options.tileInterchange) {
+    tileInterchange.push_back(value);
+  }
+
+  scf::SCFTileAndFuseOptions tileAndFuseOptions;
+  tileAndFuseOptions.tilingOptions.setTileSizes(options.tileSizes)
+      .setInterchange(tileInterchange);
+  FailureOr<scf::SCFTileAndFuseResult> fuseResult =
+      scf::tileConsumerAndFuseProducerGreedilyUsingSCFForOp(rewriter, tileOp,
+                                                            tileAndFuseOptions);
+  if (failed(fuseResult))
     return rewriter.notifyMatchFailure(
         op, "tileConsumerAndFuseProducers failed unexpectedly");
 
   // Replace all uses of the tiled loop operation.
-  rootOp->replaceAllUsesWith(tileLoopNest->getRootOpReplacementResults());
+  // rootOp->replaceAllUsesWith(tileLoopNest->getRootOpReplacementResults());
+  SmallVector<Value> replacements(rootOp->getNumResults());
+  for (auto result : llvm::enumerate(rootOp->getResults())) {
+    replacements[result.index()] =
+        fuseResult->replacements.lookup(result.value());
+  }
+  rewriter.replaceOp(rootOp, replacements);
 
   // Apply the filter if specified.
-  for (LinalgOp linalgOp : tileLoopNest->getAllTiledAndFusedOps())
-    filter.replaceLinalgTransformationFilter(rewriter, linalgOp);
-  return tileLoopNest;
+  for (Operation *op : fuseResult->tiledAndFusedOps) {
+    if (auto linalgOp = dyn_cast<LinalgOp>(op)) {
+      filter.replaceLinalgTransformationFilter(rewriter, linalgOp);
+    }
+  }
+  return TileLoopNest(rootOp);
 }
 
 /// Linalg generalization pattern.
