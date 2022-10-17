@@ -384,6 +384,9 @@ void TestTilingInterfacePass::addTestPatterns(MLIRContext *context,
     // 5. Tile and fuse a sequence of GEMMs by tiling and fusing only along M
     // dimension.
     addPatternForTileAndFuse(context, patterns, "gemm_sequence_fusion", {10});
+
+    // 6. Tile and fuse of gemm with fill producer on all dims.
+    addPatternForTileAndFuse(context, patterns, "fusion_reduction", {10, 20, 30});
     return;
   }
   if (testLoweringToScalar) {
