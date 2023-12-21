@@ -327,6 +327,51 @@ static VectorType trimNonScalableUnitDims(VectorType oldType) {
   return VectorType::get(newShape, oldType.getElementType(), newScalableDims);
 }
 
+// Trims leading one dimensions from `oldType` and returns the result type.
+// Returns `vector<1xT>` if `oldType` only has one element.
+static VectorType trimLeadingOneDims(VectorType oldType) {
+  ArrayRef<int64_t> oldShape = oldType.getShape();
+  ArrayRef<int64_t> newShape = oldShape;
+
+  ArrayRef<bool> oldScalableDims = oldType.getScalableDims();
+  ArrayRef<bool> newScalableDims = oldScalableDims;
+
+  while (!newShape.empty() && newShape.front() == 1 &&
+         !newScalableDims.front()) {
+    newShape = newShape.drop_front(1);
+    newScalableDims = newScalableDims.drop_front(1);
+  }
+
+  // Make sure we have at least 1 dimension per vector type requirements.
+  if (newShape.empty()) {
+    newShape = oldShape.take_back();
+    newScalableDims = oldType.getScalableDims().take_back();
+  }
+  return VectorType::get(newShape, oldType.getElementType(), newScalableDims);
+}
+
+/// Return a smallVector of size `rank` containing all zeros.
+static SmallVector<int64_t> splatZero(int64_t rank) {
+  return SmallVector<int64_t>(rank, 0);
+}
+
+static Value dropUnitDimsFromMask(OpBuilder &b, Location loc, Value mask,
+                                  VectorType newType, AffineMap newMap,
+                                  VectorType oldMaskType) {
+  // Infer the type of the new mask from the new map.
+  VectorType newMaskType = vector::inferTransferOpMaskType(newType, newMap);
+
+  // If the new mask is broadcastable to the old result type, we can safely
+  // use a `vector.extract` to get the new mask. Otherwise the best we can
+  // do is shape cast.
+  if (vector::isBroadcastableTo(newMaskType, oldMaskType) ==
+      vector::BroadcastableToResult::Success) {
+    int64_t dropDim = oldMaskType.getRank() - newMaskType.getRank();
+    return b.create<vector::ExtractOp>(loc, mask, splatZero(dropDim));
+  }
+  return b.create<vector::ShapeCastOp>(loc, newMaskType, mask);
+}
+
 // Rewrites vector.create_mask 'op' to drop non-scalable one dimensions.
 static FailureOr<Value>
 createMaskDropNonScalableUnitDims(PatternRewriter &rewriter, Location loc,
@@ -485,6 +530,112 @@ class TransferWriteDropUnitDimsPattern
         transferWriteOp, Type(), shapeCast, reducedShapeSource, zeros,
         identityMap, maskOp, rewriter.getBoolArrayAttr(inBounds));
 
+    return success();
+  }
+};
+
+// Turns vector.transfer_read on vector with leading 1 dimensions into
+// vector.shape_cast followed by vector.transfer_read on vector without leading
+// 1 dimensions.
+struct CastAwayTransferReadLeadingOneDim
+    : public OpRewritePattern<vector::TransferReadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::TransferReadOp read,
+                                PatternRewriter &rewriter) const override {
+    // TODO: support 0-d corner case.
+    if (read.getTransferRank() == 0)
+      return failure();
+
+    auto shapedType = cast<ShapedType>(read.getSource().getType());
+    if (shapedType.getElementType() != read.getVectorType().getElementType())
+      return failure();
+
+    VectorType oldType = read.getVectorType();
+    VectorType newType = trimLeadingOneDims(oldType);
+
+    if (newType == oldType)
+      return failure();
+
+    AffineMap oldMap = read.getPermutationMap();
+    ArrayRef<AffineExpr> newResults =
+        oldMap.getResults().take_back(newType.getRank());
+    AffineMap newMap =
+        AffineMap::get(oldMap.getNumDims(), oldMap.getNumSymbols(), newResults,
+                       rewriter.getContext());
+
+    ArrayAttr inBoundsAttr;
+    if (read.getInBounds())
+      inBoundsAttr = rewriter.getArrayAttr(
+          read.getInBoundsAttr().getValue().take_back(newType.getRank()));
+
+    Value mask = Value();
+    if (read.getMask()) {
+      VectorType maskType = read.getMaskType();
+      mask = dropUnitDimsFromMask(rewriter, read.getLoc(), read.getMask(),
+                                  newType, newMap, maskType);
+    }
+
+    auto newRead = rewriter.create<vector::TransferReadOp>(
+        read.getLoc(), newType, read.getSource(), read.getIndices(),
+        AffineMapAttr::get(newMap), read.getPadding(), mask, inBoundsAttr);
+    rewriter.replaceOpWithNewOp<vector::BroadcastOp>(read, oldType, newRead);
+
+    return success();
+  }
+};
+
+// Turns vector.transfer_write on vector with leading 1 dimensions into
+// vector.shape_cast followed by vector.transfer_write on vector without leading
+// 1 dimensions.
+struct CastAwayTransferWriteLeadingOneDim
+    : public OpRewritePattern<vector::TransferWriteOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::TransferWriteOp write,
+                                PatternRewriter &rewriter) const override {
+    // TODO: support 0-d corner case.
+    if (write.getTransferRank() == 0)
+      return failure();
+
+    auto shapedType = dyn_cast<ShapedType>(write.getSource().getType());
+    if (shapedType.getElementType() != write.getVectorType().getElementType())
+      return failure();
+
+    VectorType oldType = write.getVectorType();
+    VectorType newType = trimLeadingOneDims(oldType);
+    if (newType == oldType)
+      return failure();
+    int64_t dropDim = oldType.getRank() - newType.getRank();
+
+    AffineMap oldMap = write.getPermutationMap();
+    ArrayRef<AffineExpr> newResults =
+        oldMap.getResults().take_back(newType.getRank());
+    AffineMap newMap =
+        AffineMap::get(oldMap.getNumDims(), oldMap.getNumSymbols(), newResults,
+                       rewriter.getContext());
+
+    ArrayAttr inBoundsAttr;
+    if (write.getInBounds())
+      inBoundsAttr = rewriter.getArrayAttr(
+          write.getInBoundsAttr().getValue().take_back(newType.getRank()));
+
+    auto newVector = rewriter.create<vector::ExtractOp>(
+        write.getLoc(), write.getVector(), splatZero(dropDim));
+
+    if (write.getMask()) {
+      VectorType maskType = write.getMaskType();
+      Value newMask = dropUnitDimsFromMask(
+          rewriter, write.getLoc(), write.getMask(), newType, newMap, maskType);
+      rewriter.replaceOpWithNewOp<vector::TransferWriteOp>(
+          write, newVector, write.getSource(), write.getIndices(),
+          AffineMapAttr::get(newMap), newMask, inBoundsAttr);
+      return success();
+    }
+
+    rewriter.replaceOpWithNewOp<vector::TransferWriteOp>(
+        write, newVector, write.getSource(), write.getIndices(),
+        AffineMapAttr::get(newMap), inBoundsAttr);
     return success();
   }
 };
@@ -911,8 +1062,9 @@ void mlir::vector::populateScalarVectorTransferLoweringPatterns(
 void mlir::vector::populateVectorTransferDropUnitDimsPatterns(
     RewritePatternSet &patterns, PatternBenefit benefit) {
   patterns
-      .add<TransferReadDropUnitDimsPattern, TransferWriteDropUnitDimsPattern>(
-          patterns.getContext(), benefit);
+      .add<TransferReadDropUnitDimsPattern, TransferWriteDropUnitDimsPattern,
+           CastAwayTransferReadLeadingOneDim,
+           CastAwayTransferWriteLeadingOneDim>(patterns.getContext(), benefit);
   populateShapeCastFoldingPatterns(patterns);
 }
 
