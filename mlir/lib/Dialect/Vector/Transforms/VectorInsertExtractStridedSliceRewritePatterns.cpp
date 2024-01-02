@@ -95,6 +95,37 @@ public:
   }
 };
 
+class DecomposeUnitInsertStridedSlice final
+    : public OpRewritePattern<InsertStridedSliceOp> {
+public:
+  using OpRewritePattern<InsertStridedSliceOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(InsertStridedSliceOp op,
+                                PatternRewriter &rewriter) const override {
+    auto srcType = op.getSourceVectorType();
+    auto dstType = op.getDestVectorType();
+    // Right now restrict to 1D dst vector, can be relaxed.
+    if (srcType.getRank() != 1 || dstType.getRank() != 1)
+      return failure();
+
+    if (srcType.getShape()[0] != 1)
+      return failure();
+
+    auto loc = op.getLoc();
+    auto extractedScalar =
+        rewriter.create<ExtractOp>(loc, op.getSource(), /*position=*/0);
+    int64_t offset = op.getOffsets()
+                         .getValue()[0]
+                         .cast<IntegerAttr>()
+                         .getValue()
+                         .getSExtValue();
+    auto insertOp =
+        insertOne(rewriter, loc, extractedScalar, op.getDest(), offset);
+    rewriter.replaceOp(op, insertOp);
+    return success();
+  }
+};
+
 /// RewritePattern for InsertStridedSliceOp where source and destination vectors
 /// have the same rank. For each outermost index in the slice:
 ///   begin    end             stride
@@ -333,7 +364,8 @@ public:
 void vector::populateVectorInsertExtractStridedSliceDecompositionPatterns(
     RewritePatternSet &patterns, PatternBenefit benefit) {
   patterns.add<DecomposeDifferentRankInsertStridedSlice,
-               DecomposeNDExtractStridedSlice>(patterns.getContext(), benefit);
+               DecomposeUnitInsertStridedSlice, DecomposeNDExtractStridedSlice>(
+      patterns.getContext(), benefit);
 }
 
 void vector::populateVectorExtractStridedSliceToExtractInsertChainPatterns(
