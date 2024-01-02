@@ -364,8 +364,12 @@ public:
 void vector::populateVectorInsertExtractStridedSliceDecompositionPatterns(
     RewritePatternSet &patterns, PatternBenefit benefit) {
   patterns.add<DecomposeDifferentRankInsertStridedSlice,
-               DecomposeUnitInsertStridedSlice, DecomposeNDExtractStridedSlice>(
-      patterns.getContext(), benefit);
+               DecomposeNDExtractStridedSlice>(patterns.getContext(), benefit);
+}
+
+void vector::populateVectorDecomposeUnitInsertStridedSlicePatterns(
+    RewritePatternSet &patterns, PatternBenefit benefit) {
+  patterns.add<DecomposeUnitInsertStridedSlice>(patterns.getContext(), benefit);
 }
 
 void vector::populateVectorExtractStridedSliceToExtractInsertChainPatterns(

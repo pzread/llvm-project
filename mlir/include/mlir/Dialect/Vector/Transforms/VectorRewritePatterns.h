@@ -210,6 +210,10 @@ void populateBreakDownVectorReductionPatterns(
 void populateVectorInsertExtractStridedSliceDecompositionPatterns(
     RewritePatternSet &patterns, PatternBenefit benefit = 1);
 
+/// TODO
+void populateVectorDecomposeUnitInsertStridedSlicePatterns(
+    RewritePatternSet &patterns, PatternBenefit benefit = 1);
+
 /// Populate `patterns` with a pattern to breaks down 1-D extract_strided_slice
 /// ops into a chain of Extract ops to extract each element from the source, and
 /// then a chain of Insert ops to insert to the target vector.
